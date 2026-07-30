@@ -15,6 +15,32 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
+// OriginFile returns the `//line`-adjusted source path for pos, cleaned.
+//
+// cgo (and any generated code carrying `//line` directives) is compiled from
+// files that the go command rewrites into the build cache -- e.g. a cgo file
+// `foo.go` becomes `foo.cgo1.go` under GOCACHE. `Fset.File(pos).Name()` returns
+// that physical cache path, but `Fset.Position(pos)` honors the `//line`
+// directives cgo emits and resolves back to the real `.go` source. Keying
+// documents by this origin keeps occurrences anchored to source the repo
+// actually contains, instead of an ephemeral cache path. For ordinary files the
+// origin is the file itself, so non-generated packages are unaffected.
+func OriginFile(pkg *packages.Package, pos token.Pos) string {
+	return filepath.Clean(pkg.Fset.Position(pos).Filename)
+}
+
+// RealGoFiles is the set of a package's on-disk source files (cleaned paths).
+// Occurrences whose OriginFile is not in this set come from generated glue with
+// no real source (e.g. cgo's `_cgo_gotypes.go`, or compiler-inserted thunks
+// lacking a `//line`), and are dropped rather than mis-attributed.
+func RealGoFiles(pkg *packages.Package) map[string]struct{} {
+	set := make(map[string]struct{}, len(pkg.GoFiles))
+	for _, f := range pkg.GoFiles {
+		set[filepath.Clean(f)] = struct{}{}
+	}
+	return set
+}
+
 func VisitPackageSyntax(
 	moduleRoot string,
 	pkg *packages.Package,
@@ -22,16 +48,21 @@ func VisitPackageSyntax(
 	globalSymbols *lookup.Global,
 ) {
 	pkgSymbols := lookup.NewPackageSymbols(pkg)
+	goFiles := RealGoFiles(pkg)
 	// Iterate over all the files, collect any global symbols
 	for _, f := range pkg.Syntax {
 
-		abs := pkg.Fset.File(f.Package).Name()
-		relative, _ := filepath.Rel(moduleRoot, abs)
+		origin := OriginFile(pkg, f.Package)
+		relative, _ := filepath.Rel(moduleRoot, origin)
 
+		// Always visit to collect package-level symbols, but only keep a
+		// document for files that map to real source. Generated files (e.g.
+		// cgo's `_cgo_gotypes.go`) resolve to a non-source origin; their
+		// occurrences are compiler glue and must not become a document.
 		doc := visitSyntax(pkg, pkgSymbols, f, relative)
-
-		// Save document for pass 2
-		pathToDocuments[abs] = doc
+		if _, ok := goFiles[origin]; ok {
+			pathToDocuments[origin] = doc
+		}
 	}
 
 	globalSymbols.Add(pkgSymbols)

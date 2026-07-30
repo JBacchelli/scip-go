@@ -6,6 +6,9 @@ import (
 	"go/token"
 	"go/types"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/scip-code/scip-go/internal/document"
 	"github.com/scip-code/scip-go/internal/lookup"
@@ -21,6 +24,7 @@ func NewFileVisitor(
 	file *ast.File,
 	pkgSymbols *lookup.Package,
 	globalSymbols *lookup.Global,
+	originPath string,
 ) *fileVisitor {
 	caseClauses := map[token.Pos]types.Object{}
 	for implicit, obj := range pkg.TypesInfo.Implicits {
@@ -38,12 +42,32 @@ func NewFileVisitor(
 		doc:           doc,
 		pkg:           pkg,
 		file:          file,
+		originPath:    originPath,
+		originLineLen: loadLineLengths(originPath),
 		locals:        map[token.Pos]lookup.Local{},
 		pkgSymbols:    pkgSymbols,
 		globalSymbols: globalSymbols,
 		occurrences:   occurrences,
 		caseClauses:   caseClauses,
 	}
+}
+
+// loadLineLengths returns the byte length of each line of path (0-indexed), or
+// nil if it can't be read. Used to bounds-check occurrence ranges against the
+// real source: cgo rewrites some constructs (e.g. `defer C.f(x)`) and inserts
+// glue whose //line-adjusted position lands past the original line/EOF; such
+// occurrences can't be faithfully represented and are dropped.
+func loadLineLengths(path string) []int {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	lines := strings.Split(string(b), "\n")
+	lengths := make([]int, len(lines))
+	for i, line := range lines {
+		lengths[i] = len(strings.TrimSuffix(line, "\r"))
+	}
+	return lengths
 }
 
 // fileVisitor visits an entire file, but it must be called
@@ -57,6 +81,17 @@ type fileVisitor struct {
 	// Current file information
 	pkg  *packages.Package
 	file *ast.File
+
+	// originPath is the cleaned, //line-adjusted source file this document
+	// represents. Occurrences whose adjusted position resolves elsewhere (cgo
+	// glue, compiler-inserted thunks with no //line) are dropped rather than
+	// mis-attributed to this file. See visitors.OriginFile.
+	originPath string
+
+	// originLineLen holds the byte length of each line of originPath (0-indexed),
+	// or nil if it couldn't be read. Used to drop occurrences whose //line range
+	// falls outside the real source. See loadLineLengths.
+	originLineLen []int
 
 	// local definition position to symbol and its type information
 	locals map[token.Pos]lookup.Local
@@ -117,8 +152,9 @@ func (v *fileVisitor) Visit(n ast.Node) ast.Visitor {
 
 		if node.Name != nil && node.Name.Name != "." && node.Name.Name != "_" {
 			if sym, ok := v.globalSymbols.GetPkgSymbol(importedPackage); ok {
-				v.newReference(sym, symbols.RangeFromName(
-					v.pkg.Fset.Position(node.Name.Pos()), node.Name.Name, false), false)
+				namePos := v.pkg.Fset.Position(node.Name.Pos())
+				v.newReference(namePos, sym, symbols.RangeFromName(
+					namePos, node.Name.Name, false), false)
 			}
 		}
 
@@ -147,7 +183,7 @@ func (v *fileVisitor) Visit(n ast.Node) ast.Visitor {
 				}
 
 				symRange := scipRange(startPosition, endPosition, sel)
-				v.newReference(sym, symRange, false)
+				v.newReference(startPosition, sym, symRange, false)
 
 				// Then walk the selection
 				ast.Walk(v, node.Sel)
@@ -194,7 +230,7 @@ func (v *fileVisitor) Visit(n ast.Node) ast.Visitor {
 		// Short circuit on case clauses
 		if obj, ok := v.caseClauses[node.Pos()]; ok {
 			symName := v.createNewLocalSymbol(obj.Pos(), obj)
-			v.newDefinition(symName, scipRange(startPosition, endPosition, obj), nil, false)
+			v.newDefinition(startPosition, symName, scipRange(startPosition, endPosition, obj), nil, false)
 			return nil
 		}
 
@@ -213,6 +249,7 @@ func (v *fileVisitor) Visit(n ast.Node) ast.Visitor {
 			}
 
 			v.newDefinition(
+				startPosition,
 				symName,
 				scipRange(startPosition, endPosition, def),
 				v.enclosingRange(node),
@@ -255,7 +292,7 @@ func (v *fileVisitor) Visit(n ast.Node) ast.Visitor {
 				deprecated = document.IsDocDeprecated(symInfo.Documentation)
 			}
 
-			v.newReference(symbol, scipRange(startPosition, endPosition, ref), deprecated)
+			v.newReference(startPosition, symbol, scipRange(startPosition, endPosition, ref), deprecated)
 		}
 
 		if def == nil && ref == nil {
@@ -282,14 +319,40 @@ func (v *fileVisitor) emitImportReference(
 		return
 	}
 
-	v.newReference(sym, symbols.RangeFromName(position, importedPackage.PkgPath, true), false)
+	v.newReference(position, sym, symbols.RangeFromName(position, importedPackage.PkgPath, true), false)
+}
+
+// inOrigin reports whether an occurrence at pos with range rng belongs to, and
+// fits within, this document's source file. cgo (and other //line-annotated
+// generated code) can place occurrences at positions that resolve to a
+// different generated file, or to a line/column past the real source (e.g. a
+// rewritten `defer C.f(x)` or an inserted `_cgoCheckPointer`). Such occurrences
+// cannot be faithfully represented and are dropped rather than emitted with an
+// out-of-bounds range (which downstream SCIP consumers reject).
+func (v *fileVisitor) inOrigin(pos token.Position, rng scip.Range) bool {
+	if filepath.Clean(pos.Filename) != v.originPath {
+		return false
+	}
+	// Fall back to the filename check alone if the origin couldn't be read.
+	if v.originLineLen == nil {
+		return true
+	}
+	sl, el := int(rng.Start.Line), int(rng.End.Line)
+	if sl < 0 || sl >= len(v.originLineLen) || el < 0 || el >= len(v.originLineLen) {
+		return false
+	}
+	return int(rng.Start.Character) <= v.originLineLen[sl] &&
+		int(rng.End.Character) <= v.originLineLen[el]
 }
 
 // newDefinition emits a scip.Occurence ONLY. This will not emit a
 // new symbol. You must do that using DeclareNewSymbol[ForPos]
 func (v *fileVisitor) newDefinition(
-	symbol string, rng scip.Range, enclRng *scip.Range, deprecated bool,
+	pos token.Position, symbol string, rng scip.Range, enclRng *scip.Range, deprecated bool,
 ) {
+	if !v.inOrigin(pos, rng) {
+		return
+	}
 	occ := &scip.Occurrence{
 		TypedRange:  rng.AsTypedRange(),
 		Symbol:      symbol,
@@ -305,8 +368,11 @@ func (v *fileVisitor) newDefinition(
 }
 
 func (v *fileVisitor) newReference(
-	symbol string, rng scip.Range, deprecated bool,
+	pos token.Position, symbol string, rng scip.Range, deprecated bool,
 ) {
+	if !v.inOrigin(pos, rng) {
+		return
+	}
 	occ := &scip.Occurrence{
 		TypedRange:  rng.AsTypedRange(),
 		Symbol:      symbol,
