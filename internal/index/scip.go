@@ -125,7 +125,6 @@ func Index(writer func(proto.Message) error, opts config.IndexOpts) error {
 
 	var count uint64
 	var wg sync.WaitGroup
-	var writeErr error
 	wg.Add(1)
 
 	go func() {
@@ -144,26 +143,23 @@ func Index(writer func(proto.Message) error, opts config.IndexOpts) error {
 					continue
 				}
 
-				// If possible, any state required for created a scip document
-				// should be contained in the visitor. This makes sure that we can
-				// garbage collect everything that's there after each loop,
-				// rather than holding on to every occurrence and piece of data
+				// The visitor routes each occurrence to the document of its
+				// //line-adjusted origin (usually this file, but a generated file
+				// can attribute some occurrences to another real source file), so
+				// it needs the whole document map, not just this file's document.
 				visitor := visitors.NewFileVisitor(
 					doc,
 					pkg,
 					file,
 					pkgSymbols,
 					globalSymbols,
-					origin,
+					pathToDocument,
 				)
 
-				// Traverse the file
+				// Traverse the file (routing occurrences), then attach this
+				// file's symbols to its document.
 				ast.Walk(visitor, file)
-
-				// Write the document
-				if writeErr = writer(visitor.ToScipDocument()); writeErr != nil {
-					return
-				}
+				visitor.Finish()
 			}
 
 			atomic.AddUint64(&count, 1)
@@ -172,8 +168,12 @@ func Index(writer func(proto.Message) error, opts config.IndexOpts) error {
 
 	output.WithProgressParallel(&wg, "Visiting Project Files", &count, uint64(pkgLen))
 
-	if writeErr != nil {
-		return writeErr
+	// Emit one document per source file -- occurrences routed from every file
+	// that maps here are now accumulated -- in a stable, path-sorted order.
+	for _, origin := range slices.Sorted(maps.Keys(pathToDocument)) {
+		if err := writer(pathToDocument[origin].ToScip()); err != nil {
+			return err
+		}
 	}
 
 	// Emit external symbols for remote types that implement local interfaces

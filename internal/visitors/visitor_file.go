@@ -6,9 +6,6 @@ import (
 	"go/token"
 	"go/types"
 	"log/slog"
-	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/scip-code/scip-go/internal/document"
 	"github.com/scip-code/scip-go/internal/lookup"
@@ -24,7 +21,7 @@ func NewFileVisitor(
 	file *ast.File,
 	pkgSymbols *lookup.Package,
 	globalSymbols *lookup.Global,
-	originPath string,
+	docs map[string]*document.Document,
 ) *fileVisitor {
 	caseClauses := map[token.Pos]types.Object{}
 	for implicit, obj := range pkg.TypesInfo.Implicits {
@@ -33,41 +30,16 @@ func NewFileVisitor(
 		}
 	}
 
-	// Package occurrence always goes into the list of occurrences for a document
-	occurrences := []*scip.Occurrence{
-		doc.PackageOccurrence,
-	}
-
 	return &fileVisitor{
 		doc:           doc,
+		docs:          docs,
 		pkg:           pkg,
 		file:          file,
-		originPath:    originPath,
-		originLineLen: loadLineLengths(originPath),
 		locals:        map[token.Pos]lookup.Local{},
 		pkgSymbols:    pkgSymbols,
 		globalSymbols: globalSymbols,
-		occurrences:   occurrences,
 		caseClauses:   caseClauses,
 	}
-}
-
-// loadLineLengths returns the byte length of each line of path (0-indexed), or
-// nil if it can't be read. Used to bounds-check occurrence ranges against the
-// real source: cgo rewrites some constructs (e.g. `defer C.f(x)`) and inserts
-// glue whose //line-adjusted position lands past the original line/EOF; such
-// occurrences can't be faithfully represented and are dropped.
-func loadLineLengths(path string) []int {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	lines := strings.Split(string(b), "\n")
-	lengths := make([]int, len(lines))
-	for i, line := range lines {
-		lengths[i] = len(strings.TrimSuffix(line, "\r"))
-	}
-	return lengths
 }
 
 // fileVisitor visits an entire file, but it must be called
@@ -75,23 +47,22 @@ func loadLineLengths(path string) []int {
 //
 // Iterates over a file,
 type fileVisitor struct {
-	// Document to append occurrences to
+	// doc is the document for this file's own origin; SymbolInformation defined in
+	// the file is attached here in Finish. Occurrences are routed per-occurrence
+	// to the document of their //line-adjusted origin (see docs) -- usually doc,
+	// but a generated file (e.g. cgo's rewritten source) can attribute some of its
+	// occurrences to a different real source file.
 	doc *document.Document
+
+	// docs maps a resolved-origin absolute path to its document (the same map the
+	// index builds -- one entry per real source file). Occurrences are routed here
+	// by origin; an occurrence whose origin has no entry (cgo glue, a yacc `.y`, a
+	// build-cache path) is dropped rather than mis-attributed.
+	docs map[string]*document.Document
 
 	// Current file information
 	pkg  *packages.Package
 	file *ast.File
-
-	// originPath is the cleaned, //line-adjusted source file this document
-	// represents. Occurrences whose adjusted position resolves elsewhere (cgo
-	// glue, compiler-inserted thunks with no //line) are dropped rather than
-	// mis-attributed to this file. See visitors.OriginFile.
-	originPath string
-
-	// originLineLen holds the byte length of each line of originPath (0-indexed),
-	// or nil if it couldn't be read. Used to drop occurrences whose //line range
-	// falls outside the real source. See loadLineLengths.
-	originLineLen []int
 
 	// local definition position to symbol and its type information
 	locals map[token.Pos]lookup.Local
@@ -101,9 +72,6 @@ type fileVisitor struct {
 
 	// field definition position to symbol for the entire compliation
 	globalSymbols *lookup.Global
-
-	// occurrences in this file
-	occurrences []*scip.Occurrence
 
 	// caseClauses maps particular positions to different types for case clauses
 	caseClauses map[token.Pos]types.Object
@@ -322,27 +290,20 @@ func (v *fileVisitor) emitImportReference(
 	v.newReference(position, sym, symbols.RangeFromName(position, importedPackage.PkgPath, true), false)
 }
 
-// inOrigin reports whether an occurrence at pos with range rng belongs to, and
-// fits within, this document's source file. cgo (and other //line-annotated
-// generated code) can place occurrences at positions that resolve to a
-// different generated file, or to a line/column past the real source (e.g. a
-// rewritten `defer C.f(x)` or an inserted `_cgoCheckPointer`). Such occurrences
-// cannot be faithfully represented and are dropped rather than emitted with an
-// out-of-bounds range (which downstream SCIP consumers reject).
-func (v *fileVisitor) inOrigin(pos token.Position, rng scip.Range) bool {
-	if filepath.Clean(pos.Filename) != v.originPath {
-		return false
+// targetDoc resolves the document an occurrence at pos with range rng belongs
+// to, or nil if it should be dropped. An occurrence's true home is its
+// //line-adjusted origin file: usually the file being walked, but a generated
+// file (cgo, ...) can attribute an occurrence to a *different* real source file,
+// in which case it is routed there rather than dropped. An occurrence whose
+// origin is not a real source document (cgo glue, a yacc `.y`, a build-cache
+// path), or whose range escapes that document's source, is dropped rather than
+// emitted with a bogus location (which downstream SCIP consumers reject).
+func (v *fileVisitor) targetDoc(pos token.Position, rng scip.Range) *document.Document {
+	doc := v.docs[CleanResolve(pos.Filename)]
+	if doc == nil || !doc.InBounds(rng) {
+		return nil
 	}
-	// Fall back to the filename check alone if the origin couldn't be read.
-	if v.originLineLen == nil {
-		return true
-	}
-	sl, el := int(rng.Start.Line), int(rng.End.Line)
-	if sl < 0 || sl >= len(v.originLineLen) || el < 0 || el >= len(v.originLineLen) {
-		return false
-	}
-	return int(rng.Start.Character) <= v.originLineLen[sl] &&
-		int(rng.End.Character) <= v.originLineLen[el]
+	return doc
 }
 
 // newDefinition emits a scip.Occurence ONLY. This will not emit a
@@ -350,7 +311,8 @@ func (v *fileVisitor) inOrigin(pos token.Position, rng scip.Range) bool {
 func (v *fileVisitor) newDefinition(
 	pos token.Position, symbol string, rng scip.Range, enclRng *scip.Range, deprecated bool,
 ) {
-	if !v.inOrigin(pos, rng) {
+	doc := v.targetDoc(pos, rng)
+	if doc == nil {
 		return
 	}
 	occ := &scip.Occurrence{
@@ -358,19 +320,22 @@ func (v *fileVisitor) newDefinition(
 		Symbol:      symbol,
 		SymbolRoles: int32(scip.SymbolRole_Definition),
 	}
-	if enclRng != nil {
+	// Keep the enclosing range only if it fits the same source (a cgo-expanded
+	// body can push it past EOF even when the name range is fine).
+	if enclRng != nil && doc.InBounds(*enclRng) {
 		occ.TypedEnclosingRange = enclRng.AsTypedEnclosingRange()
 	}
 	if deprecated {
 		occ.Diagnostics = deprecatedDiagnostics()
 	}
-	v.occurrences = append(v.occurrences, occ)
+	doc.AppendOccurrence(occ)
 }
 
 func (v *fileVisitor) newReference(
 	pos token.Position, symbol string, rng scip.Range, deprecated bool,
 ) {
-	if !v.inOrigin(pos, rng) {
+	doc := v.targetDoc(pos, rng)
+	if doc == nil {
 		return
 	}
 	occ := &scip.Occurrence{
@@ -381,13 +346,16 @@ func (v *fileVisitor) newReference(
 	if deprecated {
 		occ.Diagnostics = deprecatedDiagnostics()
 	}
-	v.occurrences = append(v.occurrences, occ)
+	doc.AppendOccurrence(occ)
 }
 
-func (v *fileVisitor) ToScipDocument() *scip.Document {
+// Finish attaches the file's SymbolInformation (package-level symbols defined in
+// the file, plus locals) to the file's own document. Occurrences are routed to
+// their origin documents during the walk; call Finish once after the walk.
+func (v *fileVisitor) Finish() {
 	documentFile := v.pkg.Fset.File(v.file.Pos())
 	if documentFile == nil {
-		panic("that shouldn't happend")
+		return
 	}
 
 	documentSymbols := v.pkgSymbols.SymbolsForFile(documentFile)
@@ -415,12 +383,7 @@ func (v *fileVisitor) ToScipDocument() *scip.Document {
 		documentSymbols = append(documentSymbols, symbolInfo)
 	}
 
-	return &scip.Document{
-		Language:     "go",
-		RelativePath: v.doc.RelativePath,
-		Occurrences:  v.occurrences,
-		Symbols:      documentSymbols,
-	}
+	v.doc.AddSymbols(documentSymbols)
 }
 
 func (v *fileVisitor) enclosingRange(n *ast.Ident) *scip.Range {

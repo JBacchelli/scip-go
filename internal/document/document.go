@@ -38,11 +38,14 @@ func IsDocDeprecated(docs []string) bool {
 
 func NewDocument(
 	relative string,
+	originAbs string,
 	pkg *packages.Package,
 	pkgSymbols *lookup.Package,
 ) *Document {
 	return &Document{
 		RelativePath: relative,
+		originAbs:    originAbs,
+		lineLen:      loadLineLengths(originAbs),
 		pkg:          pkg,
 		pkgSymbols:   pkgSymbols,
 
@@ -70,6 +73,90 @@ type Document struct {
 	// pkgSymbols maps positions to symbol names within
 	// this document.
 	pkgSymbols *lookup.Package
+
+	// originAbs is the cleaned, symlink-resolved absolute path of the source file
+	// this document represents; lineLen is the byte length of each of its lines
+	// (0-indexed), or nil if it couldn't be read. Together they let AppendOccurrence
+	// callers reject occurrences whose //line-adjusted range escapes the real file.
+	originAbs string
+	lineLen   []int
+
+	// occurrences accumulates every occurrence routed to this document. Usually
+	// that is only its own file's, but a generated file may attribute occurrences
+	// here via //line directives (e.g. cgo's rewritten source). extraSymbols
+	// accumulates SymbolInformation from the file(s) that map here.
+	occurrences  []*scip.Occurrence
+	extraSymbols []*scip.SymbolInformation
+}
+
+// InBounds reports whether r is a well-formed range that fits within this
+// document's source file. It rejects:
+//   - negative line/column (a `//line file:N` directive with no column collapses
+//     positions to column 0 -> scip -1, which is malformed);
+//   - lines past EOF or columns past the line (cgo's `defer C.f(x)` rewrites and
+//     inserted `_cgoCheckPointer` thunks land here);
+//   - reversed ranges (end before start).
+//
+// Such occurrences cannot be faithfully represented and are dropped rather than
+// emitted with a bogus location (which downstream SCIP consumers reject). A
+// document whose source could not be read admits everything (no over-dropping).
+func (d *Document) InBounds(r scip.Range) bool {
+	sl, sc, el, ec := int(r.Start.Line), int(r.Start.Character), int(r.End.Line), int(r.End.Character)
+	if sl < 0 || sc < 0 || el < 0 || ec < 0 {
+		return false
+	}
+	if el < sl || (el == sl && ec < sc) {
+		return false
+	}
+	if d.lineLen == nil {
+		return true
+	}
+	if sl >= len(d.lineLen) || el >= len(d.lineLen) {
+		return false
+	}
+	return sc <= d.lineLen[sl] && ec <= d.lineLen[el]
+}
+
+// AppendOccurrence records occ against this document. Called from the single
+// file-walking goroutine, so no synchronization is required.
+func (d *Document) AppendOccurrence(occ *scip.Occurrence) {
+	d.occurrences = append(d.occurrences, occ)
+}
+
+// AddSymbols records SymbolInformation contributed by a file that maps here.
+func (d *Document) AddSymbols(syms []*scip.SymbolInformation) {
+	d.extraSymbols = append(d.extraSymbols, syms...)
+}
+
+// ToScip renders the accumulated occurrences and symbols as a scip.Document.
+func (d *Document) ToScip() *scip.Document {
+	occurrences := d.occurrences
+	if d.PackageOccurrence != nil {
+		occurrences = append([]*scip.Occurrence{d.PackageOccurrence}, occurrences...)
+	}
+	return &scip.Document{
+		Language:     "go",
+		RelativePath: d.RelativePath,
+		Occurrences:  occurrences,
+		Symbols:      d.extraSymbols,
+	}
+}
+
+// loadLineLengths returns the byte length of each line of path (0-indexed), or
+// nil if it can't be read. Used to bounds-check occurrence ranges against the
+// real source (cgo rewrites some constructs to positions past the original
+// line/EOF; those can't be faithfully represented and are dropped).
+func loadLineLengths(path string) []int {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	lines := strings.Split(string(b), "\n")
+	lengths := make([]int, len(lines))
+	for i, line := range lines {
+		lengths[i] = len(strings.TrimSuffix(line, "\r"))
+	}
+	return lengths
 }
 
 func (d *Document) GetSymbol(pos token.Pos) (string, bool) {
