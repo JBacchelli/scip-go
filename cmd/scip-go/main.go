@@ -24,16 +24,17 @@ import (
 )
 
 type SharedFlags struct {
-	ModuleRoot          string   `help:"Specifies the directory containing the go.mod file." default:"${module_root}"`
-	RepositoryRemote    string   `help:"Specifies the canonical name of the repository remote." default:"${repository_remote}"`
-	ModulePath          string   `help:"Overrides the module path inferred from go.mod."`
-	ModuleVersion       string   `help:"Specifies the version of the module defined by module-root." default:"${module_version}"`
-	GoVersion           string   `help:"Specifies the version of the Go standard library to link to. Format: 'go1.XX'" default:"${go_version}"`
-	Quiet               bool     `help:"Do not output to stdout or stderr." short:"q"`
-	Verbose             int      `help:"Output debug logs." short:"V" type:"counter"`
-	SkipImplementations bool     `help:"Skip implementations. Use to skip generating implementations"`
-	SkipTests           bool     `help:"Skip compiling tests. Will not generate scip indexes over your or your dependencies tests"`
-	PackagePatterns     []string `arg:"" optional:"" help:"Package patterns to index. Default: './...' which indexes all packages in the current directory recursively. For the full syntax of allowed package patterns, see https://pkg.go.dev/cmd/go#hdr-Package_lists_and_patterns" default:"./..."`
+	ModuleRoot           string   `help:"Specifies the directory containing the go.mod file." default:"${module_root}"`
+	RepositoryRemote     string   `help:"Specifies the canonical name of the repository remote." default:"${repository_remote}"`
+	ModulePath           string   `help:"Overrides the module path inferred from go.mod."`
+	ModuleVersion        string   `help:"Specifies the version of the module defined by module-root." default:"${module_version}"`
+	GoVersion            string   `help:"Specifies the version of the Go standard library to link to. Format: 'go1.XX'" default:"${go_version}"`
+	Quiet                bool     `help:"Do not output to stdout or stderr." short:"q"`
+	Verbose              int      `help:"Output debug logs." short:"V" type:"counter"`
+	SkipImplementations  bool     `help:"Skip implementations. Use to skip generating implementations"`
+	SkipTests            bool     `help:"Skip compiling tests. Will not generate scip indexes over your or your dependencies tests"`
+	EmitDeprecatedRanges bool     `help:"Also emit the deprecated flat 'range' field on occurrences (alongside typed_range), for consumers that don't read typed ranges yet (e.g. Meta's glean-encode-scip2)."`
+	PackagePatterns      []string `arg:"" optional:"" help:"Package patterns to index. Default: './...' which indexes all packages in the current directory recursively. For the full syntax of allowed package patterns, see https://pkg.go.dev/cmd/go#hdr-Package_lists_and_patterns" default:"./..."`
 }
 
 type IndexCmd struct {
@@ -112,6 +113,7 @@ func makeOptions(shared *SharedFlags) (config.IndexOpts, error) {
 		IsIndexingStdlib:      isStdLib,
 		SkipImplementations:   shared.SkipImplementations,
 		SkipTests:             shared.SkipTests,
+		EmitDeprecatedRanges:  shared.EmitDeprecatedRanges,
 		PackagePatterns:       shared.PackagePatterns,
 		Arguments:             os.Args[1:],
 		IsGoPackagesDriverSet: isPackagesDriverSet,

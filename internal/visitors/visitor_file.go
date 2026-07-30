@@ -25,6 +25,7 @@ func NewFileVisitor(
 	pkgSymbols *lookup.Package,
 	globalSymbols *lookup.Global,
 	originPath string,
+	emitDeprecatedRanges bool,
 ) *fileVisitor {
 	caseClauses := map[token.Pos]types.Object{}
 	for implicit, obj := range pkg.TypesInfo.Implicits {
@@ -39,16 +40,17 @@ func NewFileVisitor(
 	}
 
 	return &fileVisitor{
-		doc:           doc,
-		pkg:           pkg,
-		file:          file,
-		originPath:    originPath,
-		originLineLen: loadLineLengths(originPath),
-		locals:        map[token.Pos]lookup.Local{},
-		pkgSymbols:    pkgSymbols,
-		globalSymbols: globalSymbols,
-		occurrences:   occurrences,
-		caseClauses:   caseClauses,
+		doc:                  doc,
+		pkg:                  pkg,
+		file:                 file,
+		originPath:           originPath,
+		originLineLen:        loadLineLengths(originPath),
+		emitDeprecatedRanges: emitDeprecatedRanges,
+		locals:               map[token.Pos]lookup.Local{},
+		pkgSymbols:           pkgSymbols,
+		globalSymbols:        globalSymbols,
+		occurrences:          occurrences,
+		caseClauses:          caseClauses,
 	}
 }
 
@@ -92,6 +94,10 @@ type fileVisitor struct {
 	// or nil if it couldn't be read. Used to drop occurrences whose //line range
 	// falls outside the real source. See loadLineLengths.
 	originLineLen []int
+
+	// emitDeprecatedRanges also fills the deprecated flat `range` fields on
+	// emitted occurrences (see ToScipDocument). See config.EmitDeprecatedRanges.
+	emitDeprecatedRanges bool
 
 	// local definition position to symbol and its type information
 	locals map[token.Pos]lookup.Local
@@ -415,12 +421,48 @@ func (v *fileVisitor) ToScipDocument() *scip.Document {
 		documentSymbols = append(documentSymbols, symbolInfo)
 	}
 
+	if v.emitDeprecatedRanges {
+		backfillDeprecatedRanges(v.occurrences)
+	}
+
 	return &scip.Document{
 		Language:     "go",
 		RelativePath: v.doc.RelativePath,
 		Occurrences:  v.occurrences,
 		Symbols:      documentSymbols,
 	}
+}
+
+// backfillDeprecatedRanges populates the deprecated flat `range` /
+// `enclosing_range` fields from the typed ranges, for SCIP consumers that don't
+// read `typed_range` (e.g. Meta's glean-encode-scip2). Typed ranges are left
+// intact -- this is a dual-write, not a replacement.
+func backfillDeprecatedRanges(occurrences []*scip.Occurrence) {
+	for _, occ := range occurrences {
+		if occ == nil {
+			continue
+		}
+		if len(occ.Range) == 0 {
+			if r, ok := occ.SourceRange(); ok {
+				occ.Range = deprecatedRangeSlice(r)
+			}
+		}
+		if len(occ.EnclosingRange) == 0 {
+			if r, ok := occ.EnclosingSourceRange(); ok {
+				occ.EnclosingRange = deprecatedRangeSlice(r)
+			}
+		}
+	}
+}
+
+// deprecatedRangeSlice encodes r as the deprecated flat SCIP range: 3 elements
+// [line, startChar, endChar] when it fits on one line, else 4 elements
+// [startLine, startChar, endLine, endChar].
+func deprecatedRangeSlice(r scip.Range) []int32 {
+	if r.Start.Line == r.End.Line {
+		return []int32{r.Start.Line, r.Start.Character, r.End.Character}
+	}
+	return []int32{r.Start.Line, r.Start.Character, r.End.Line, r.End.Character}
 }
 
 func (v *fileVisitor) enclosingRange(n *ast.Ident) *scip.Range {

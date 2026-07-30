@@ -23,4 +23,10 @@ type IndexOpts struct {
 
 	// Arguments passed to the CLI
 	Arguments []string
+
+	// EmitDeprecatedRanges also populates the deprecated flat `range` (and
+	// `enclosing_range`) fields on occurrences, alongside the typed ranges.
+	// Needed for SCIP consumers that don't read `typed_range` yet (e.g. Meta's
+	// glean-encode-scip2). Off by default: the default output stays typed-only.
+	EmitDeprecatedRanges bool
 }

@@ -155,6 +155,7 @@ func Index(writer func(proto.Message) error, opts config.IndexOpts) error {
 					pkgSymbols,
 					globalSymbols,
 					origin,
+					opts.EmitDeprecatedRanges,
 				)
 
 				// Traverse the file
