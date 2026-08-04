@@ -10,6 +10,7 @@ import (
 	"go/types"
 	"log/slog"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -81,6 +82,12 @@ type Document struct {
 	originAbs string
 	lineLen   []int
 
+	// lines is the document's source split by line, loaded lazily by lineText:
+	// only documents that need a range repair pay to keep their source resident.
+	// linesLoaded distinguishes "not tried yet" from "tried and unreadable".
+	lines       []string
+	linesLoaded bool
+
 	// occurrences accumulates every occurrence routed to this document. Usually
 	// that is only its own file's, but a generated file may attribute occurrences
 	// here via //line directives (e.g. cgo's rewritten source). extraSymbols
@@ -115,6 +122,66 @@ func (d *Document) InBounds(r scip.Range) bool {
 		return false
 	}
 	return sc <= d.lineLen[sl] && ec <= d.lineLen[el]
+}
+
+// cgoSourceName matches the text cgo rewrote into a mangled identifier: a
+// `C.foo` selector, or a bare identifier for manglings that drop the prefix.
+// Anchored, so it only matches at the column the range starts on.
+var cgoSourceName = regexp.MustCompile(`^(?:C\.)?[\p{L}_][\p{L}\p{Nd}_]*`)
+
+// RepairRange rebuilds an out-of-bounds range from the source text it actually
+// covers, returning the replacement and true when one is available.
+//
+// A range's width comes from the identifier the type checker sees, and cgo's
+// identifiers are mangled: `C.puts` is rewritten to `_Cfunc_puts`, so a range
+// anchored at the right column is emitted five characters too wide and can spill
+// past the end of the real line. The position is fine; only the width is wrong.
+// Measuring the identifier that is genuinely at that column recovers the
+// occurrence instead of discarding it.
+//
+// Only a single-line range starting inside real source can be repaired. A
+// synthesized position -- cgo's `defer C.f(x)` wrapper, which lands at
+// end-of-line where there is no identifier to measure -- matches nothing and is
+// still dropped, so this never invents a location.
+func (d *Document) RepairRange(r scip.Range) (scip.Range, bool) {
+	if r.Start.Line != r.End.Line || r.Start.Line < 0 || r.Start.Character < 0 {
+		return r, false
+	}
+	line, ok := d.lineText(int(r.Start.Line))
+	if !ok || int(r.Start.Character) >= len(line) {
+		return r, false
+	}
+	name := cgoSourceName.FindString(line[r.Start.Character:])
+	if name == "" {
+		return r, false
+	}
+	repaired := scip.Range{
+		Start: r.Start,
+		End: scip.Position{
+			Line:      r.Start.Line,
+			Character: r.Start.Character + int32(len(name)),
+		},
+	}
+	if !d.InBounds(repaired) {
+		return r, false
+	}
+	return repaired, true
+}
+
+// lineText returns 0-indexed line l of this document's source. The source is
+// read on first use and cached, so documents that never need a repair keep only
+// their line lengths.
+func (d *Document) lineText(l int) (string, bool) {
+	if !d.linesLoaded {
+		d.linesLoaded = true
+		if b, err := os.ReadFile(d.originAbs); err == nil {
+			d.lines = strings.Split(string(b), "\n")
+		}
+	}
+	if l < 0 || l >= len(d.lines) {
+		return "", false
+	}
+	return strings.TrimSuffix(d.lines[l], "\r"), true
 }
 
 // AppendOccurrence records occ against this document. Called from the single

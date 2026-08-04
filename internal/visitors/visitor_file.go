@@ -291,19 +291,32 @@ func (v *fileVisitor) emitImportReference(
 }
 
 // targetDoc resolves the document an occurrence at pos with range rng belongs
-// to, or nil if it should be dropped. An occurrence's true home is its
-// //line-adjusted origin file: usually the file being walked, but a generated
-// file (cgo, ...) can attribute an occurrence to a *different* real source file,
-// in which case it is routed there rather than dropped. An occurrence whose
-// origin is not a real source document (cgo glue, a yacc `.y`, a build-cache
-// path), or whose range escapes that document's source, is dropped rather than
-// emitted with a bogus location (which downstream SCIP consumers reject).
-func (v *fileVisitor) targetDoc(pos token.Position, rng scip.Range) *document.Document {
+// to, along with the range to emit. A nil document means drop the occurrence.
+//
+// An occurrence's true home is its //line-adjusted origin file: usually the file
+// being walked, but a generated file (cgo, ...) can attribute an occurrence to a
+// *different* real source file, in which case it is routed there rather than
+// dropped. An occurrence whose origin is not a real source document (cgo glue, a
+// yacc `.y`, a build-cache path) is dropped.
+//
+// A range that escapes the origin's source gets one repair attempt first: cgo
+// widens ranges by mangling identifiers (`C.puts` -> `_Cfunc_puts`), which pushes
+// a correctly-positioned occurrence past end-of-line, and Document.RepairRange
+// re-measures it against the real source. Only when that fails is the occurrence
+// dropped, rather than emitted with a bogus location (which downstream SCIP
+// consumers reject).
+func (v *fileVisitor) targetDoc(pos token.Position, rng scip.Range) (*document.Document, scip.Range) {
 	doc := v.docs[CleanResolve(pos.Filename)]
-	if doc == nil || !doc.InBounds(rng) {
-		return nil
+	if doc == nil {
+		return nil, rng
 	}
-	return doc
+	if doc.InBounds(rng) {
+		return doc, rng
+	}
+	if repaired, ok := doc.RepairRange(rng); ok {
+		return doc, repaired
+	}
+	return nil, rng
 }
 
 // newDefinition emits a scip.Occurence ONLY. This will not emit a
@@ -311,7 +324,7 @@ func (v *fileVisitor) targetDoc(pos token.Position, rng scip.Range) *document.Do
 func (v *fileVisitor) newDefinition(
 	pos token.Position, symbol string, rng scip.Range, enclRng *scip.Range, deprecated bool,
 ) {
-	doc := v.targetDoc(pos, rng)
+	doc, rng := v.targetDoc(pos, rng)
 	if doc == nil {
 		return
 	}
@@ -334,7 +347,7 @@ func (v *fileVisitor) newDefinition(
 func (v *fileVisitor) newReference(
 	pos token.Position, symbol string, rng scip.Range, deprecated bool,
 ) {
-	doc := v.targetDoc(pos, rng)
+	doc, rng := v.targetDoc(pos, rng)
 	if doc == nil {
 		return
 	}
