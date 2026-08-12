@@ -226,14 +226,18 @@ func indexVisitPackages(
 
 			pkgSymbol, _ := globalSymbols.GetPkgSymbol(pkg)
 
+			pkgSignature := "package " + pkg.Name
 			symInfo := &scip.SymbolInformation{
-				Symbol:        pkgSymbol,
-				Kind:          scip.SymbolInformation_Package,
-				DisplayName:   pkg.Name,
-				Documentation: findPackageDocs(pkg),
+				Symbol:      pkgSymbol,
+				Kind:        scip.SymbolInformation_Package,
+				DisplayName: pkg.Name,
+				Documentation: append(
+					[]string{symbols.FormatCode(pkgSignature)},
+					findPackageDocs(pkg)...,
+				),
 				SignatureDocumentation: &scip.Signature{
 					Language: "go",
-					Text:     "package " + pkg.Name,
+					Text:     pkgSignature,
 				},
 			}
 			// Attach the package symbol to the first real document and a

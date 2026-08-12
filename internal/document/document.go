@@ -274,14 +274,20 @@ func (d *Document) SetNewSymbolForPos(
 					Language: "go",
 					Text:     signature,
 				}
+				// Also render the signature into `documentation`: consumers that predate
+				// `signature_documentation` read only that field, and would otherwise lose
+				// the signature entirely.
+				documentation = append(documentation, symbols.FormatCode(signature))
 			}
 		}
+		var hoverText string
 		if hover := d.extractHoverText(parent, ident); hover != "" {
+			hoverText = hover
 			documentation = append(documentation, hover)
 		}
 		if genDecl, ok := parent.(*ast.GenDecl); ok && genDecl.Doc != nil {
 			blockDoc := strings.TrimSpace(genDecl.Doc.Text())
-			if blockDoc != "" && (len(documentation) == 0 || documentation[0] != blockDoc) {
+			if blockDoc != "" && blockDoc != hoverText {
 				documentation = append(documentation, blockDoc)
 			}
 		}
